@@ -26,7 +26,6 @@
 static char *ReleaseVersion="1.4.2";
 
 #include <sys/types.h>
-#include <sys/time.h>
 
 #ifdef __NetBSD__
 #define ENVSYSUNITNAMES
@@ -37,11 +36,15 @@ static char *ReleaseVersion="1.4.2";
 #include <string.h>
 #endif /* __NetBSD__ */
 
-#include <signal.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <unistd.h>
+#include <time.h>
+#include <err.h>
+#include <errno.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
 #include <X11/Xlib.h>
 
 #define PollingInterval 10	/* APM polling interval in sec */
@@ -78,8 +81,6 @@ char *OFFIN_C  = "blue";
 char *OFFOUT_C = "red";
 
 int alwaysontop = False;
-
-struct itimerval IntervalTimer;     /* APM polling interval timer */
 
 int bi_direction = BI_Bottom;       /* status bar location */
 int bi_height;                      /* height of Battery Indicator */
@@ -139,6 +140,15 @@ void usage(char **argv)
     "top, bottom, left, right: bar localtion. [def: \"bottom\"]\n",
 	  argv[0]);
   exit(0);
+}
+
+static int64_t
+gettime_ms(void)
+{
+  struct timespec ts;
+
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 /*
@@ -221,16 +231,22 @@ void InitDisplay(void)
   att.override_redirect = True;
   XChangeWindowAttributes(disp, winbar, CWOverrideRedirect, &att);
 
+  /* set window event_mask to check window events by polling with select(2) */
+  att.event_mask = myEventMask;
+  XChangeWindowAttributes(disp, winbar, CWEventMask, &att);
+
   XMapWindow(disp, winbar);
 
   gcbar = XCreateGC(disp, winbar, 0, 0);
 }
 
-main(int argc, char **argv)
+int main(int argc, char **argv)
 {
   extern char *optarg;
   extern int optind;
   int ch;
+  int64_t next_ms;
+  int xfd;
 
   about_this_program();
   while ((ch = getopt(argc, argv, "at:f:hI:i:O:o:p:v")) != -1)
@@ -281,53 +297,76 @@ main(int argc, char **argv)
   }
 
   /*
-   * set APM polling interval timer
-   */
-  IntervalTimer.it_interval.tv_sec = (long)bi_interval;
-  IntervalTimer.it_interval.tv_usec = (long)0;
-  IntervalTimer.it_value.tv_sec = (long)1;
-  IntervalTimer.it_value.tv_usec = (long)0;
-  if ( setitimer(ITIMER_REAL, &IntervalTimer, NULL) != 0 ) {
-    fprintf(stderr,"xbattbar: can't set interval timer\n");
-    exit(1);
-  }
-
-  /*
    * X Window main loop
    */
   InitDisplay();
-  signal(SIGALRM, (void *)(battery_check));
   battery_check();
-  XSelectInput(disp, winbar, myEventMask);
+  next_ms = gettime_ms() + bi_interval * 1000;
+  xfd = ConnectionNumber(disp);
+
   while (1) {
-    XWindowEvent(disp, winbar, myEventMask, &theEvent);
-    switch (theEvent.type) {
-    case Expose:
-      /* we redraw our window since our window has been exposed. */
-      redraw();
-      break;
+    fd_set fds;
+    struct timeval tv;
+    int64_t wait_ms;
+    int rv;
 
-    case EnterNotify:
-      /* create battery status message */
-      showdiagbox();
-      break;
+    FD_ZERO(&fds);
+    FD_SET(xfd, &fds);
+    wait_ms = next_ms - gettime_ms();
+    if (wait_ms < 0) {
+      wait_ms = 0;
+    }
+    tv.tv_sec = wait_ms / 1000;
+    tv.tv_usec = (wait_ms % 1000) * 1000;
+    rv = select(xfd + 1, &fds, NULL, NULL, &tv);
+    if (rv < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      perror("select");
+      exit(EXIT_FAILURE);
+    }
 
-    case LeaveNotify:
-      /* destroy status window */
-      disposediagbox();
-      break;
+    if (rv > 0 && FD_ISSET(xfd, &fds)) {
+      while (XPending(disp) > 0) {
+        XNextEvent(disp, &theEvent);
+        switch (theEvent.type) {
+        case Expose:
+          /* we redraw our window since our window has been exposed. */
+          redraw();
+          break;
 
-    case VisibilityNotify:
-      if (alwaysontop) XRaiseWindow(disp, winbar);
-      break;
+        case EnterNotify:
+          /* create battery status message */
+          showdiagbox();
+          break;
 
-    default:
-      /* for debugging */
-      fprintf(stderr, 
-	      "xbattbar: unknown event (%d) captured\n",
-	      theEvent.type);
+        case LeaveNotify:
+          /* destroy status window */
+          disposediagbox();
+          break;
+
+        case VisibilityNotify:
+          if (alwaysontop) XRaiseWindow(disp, winbar);
+          break;
+
+        default:
+          /* for debugging */
+          fprintf(stderr, 
+              "xbattbar: unknown event (%d) captured\n",
+              theEvent.type);
+        }
+      }
+    }
+    if (gettime_ms() >= next_ms) {
+      battery_check();
+      while (gettime_ms() >= next_ms) {
+        next_ms += bi_interval * 1000;
+      }
     }
   }
+
+  exit(EXIT_SUCCESS);
 }
 
 void redraw(void)
@@ -504,7 +543,6 @@ void battery_check(void)
     battery_level = ar.cret&0xff;
     redraw();
   }
-  signal(SIGALRM, (void *)(battery_check));
 }
 
 #endif /* __bsdi__ */
@@ -580,7 +618,6 @@ void battery_check(void)
     battery_level = r;
     redraw();
   }
-  signal(SIGALRM, (void *)(battery_check));
 }
 
 #endif /* __FreeBSD__ */
@@ -834,7 +871,6 @@ void battery_check(void)
   errno = 0;
   if ( (pt = fopen( APM_PROC, "r" )) == NULL) {
     fprintf(stderr, "xbattbar: Can't read proc info: %s\n", strerror(errno));
-    signal(SIGALRM, (void *)(battery_check));
     exit(1);
   }
 
@@ -874,7 +910,6 @@ void battery_check(void)
     battery_level = r;
     redraw();
   }
-  signal(SIGALRM, (void *)(battery_check));
 }
 
 #endif /* linux */
