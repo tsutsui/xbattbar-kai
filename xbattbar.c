@@ -97,11 +97,16 @@ static int have_x = 0, have_y = 0;
 #define TIP_PAD_X	6
 #define TIP_PAD_Y	4
 #define TIP_MSGLEN	128
+#define TIP_DELAY	1000    /* ms */
 
 static Window tip = (Window)0;
 static int tip_mapped = 0;
 static unsigned int tip_pad_x = TIP_PAD_X, tip_pad_y = TIP_PAD_Y;
 static char tipmsg[TIP_MSGLEN];
+static const int tip_delay_ms = TIP_DELAY;
+static int tip_hovering = 0;
+static int64_t tip_disp_ms = 0;
+static int tip_xroot = 0, tip_yroot = 0;
 
 /*
  * function prototypes
@@ -311,15 +316,29 @@ int main(int argc, char **argv)
   while (1) {
     fd_set fds;
     struct timeval tv;
-    int64_t wait_ms;
+    int64_t current_ms, wait_ms, battwait_ms, hoverwait_ms;
     int rv;
 
     FD_ZERO(&fds);
     FD_SET(xfd, &fds);
-    wait_ms = next_ms - gettime_ms();
-    if (wait_ms < 0) {
-      wait_ms = 0;
+
+    /* Calculate wait time to poll the next battery status */
+    current_ms = gettime_ms();
+    battwait_ms = next_ms - current_ms;
+    if (battwait_ms < 0) {
+      battwait_ms = 0;
     }
+
+    /* Calculate wait time for delayed tooltip */
+    hoverwait_ms = INT64_MAX;
+    if (tip_hovering && !tip_mapped) {
+      hoverwait_ms = tip_disp_ms - current_ms;
+      if (hoverwait_ms < 0) {
+        hoverwait_ms = 0;
+      }
+    }
+    wait_ms = (battwait_ms < hoverwait_ms) ? battwait_ms : hoverwait_ms;
+
     tv.tv_sec = wait_ms / 1000;
     tv.tv_usec = (wait_ms % 1000) * 1000;
     rv = select(xfd + 1, &fds, NULL, NULL, &tv);
@@ -346,13 +365,22 @@ int main(int argc, char **argv)
           break;
 
         case EnterNotify:
-          tip_show(theEvent.xcrossing.x_root, theEvent.xcrossing.y_root);
+          tip_hovering = 1;
+          tip_disp_ms = gettime_ms() + tip_delay_ms;
+          tip_xroot = theEvent.xcrossing.x_root;
+          tip_yroot = theEvent.xcrossing.y_root;
+          tip_hide();
           break;
         case LeaveNotify:
+          tip_hovering = 0;
           tip_hide();
           break;
         case MotionNotify:
-          tip_show(theEvent.xmotion.x_root, theEvent.xmotion.y_root);
+          tip_xroot = theEvent.xmotion.x_root;
+          tip_yroot = theEvent.xmotion.y_root;
+          if (tip_mapped) {
+            tip_show(tip_xroot, tip_yroot);
+          }
           break;
 
         case ClientMessage:
@@ -368,6 +396,9 @@ int main(int argc, char **argv)
       while (gettime_ms() >= next_ms) {
         next_ms += bi_interval * 1000;
       }
+    }
+    if (tip_hovering && !tip_mapped && gettime_ms() >= tip_disp_ms) {
+      tip_show(tip_xroot, tip_yroot);
     }
   }
 
