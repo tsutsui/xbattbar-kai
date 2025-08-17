@@ -52,6 +52,8 @@ static char *ReleaseVersion="1.4.2";
 #define PollingInterval 10	/* APM polling interval in sec */
 
 #define DefaultFont "fixed"
+#define DefaultFontH 14
+#define DefaultFontW 7
 
 /*
  * Global variables
@@ -460,7 +462,7 @@ static void draw_widget(void)
   }
 
   /* capacity percentage */
-  if (fontp && gc_text) {
+  if (fontp != NULL && gc_text != 0) {
     char buf[8];
     int len = snprintf(buf, sizeof(buf), "%u%%", pct);
     int tw = XTextWidth(fontp, buf, len);
@@ -562,12 +564,13 @@ static void tip_draw(void)
   XDrawRectangle(disp, tip, gc_frame, 0, 0, width - 1, height - 1);
 
   /* status strings */
-  XFontStruct *fp = fontp ? fontp : XLoadQueryFont(disp, "fixed");
-  int ty = (int)tip_pad_y + (fp ? fp->ascent : 10);
-  int tx = (int)tip_pad_x;
+  if (fontp != NULL && gc_text != 0) {
+    int ty = (int)tip_pad_y + fontp->ascent;
+    int tx = (int)tip_pad_x;
 
-  XSetForeground(disp, gc_text, pix_fg);
-  XDrawString(disp, tip, gc_text, tx, ty, tipmsg, strlen(tipmsg));
+    XSetForeground(disp, gc_text, pix_fg);
+    XDrawString(disp, tip, gc_text, tx, ty, tipmsg, strlen(tipmsg));
+  }
 
   XFlush(disp);
 }
@@ -576,14 +579,20 @@ static void tip_show(int root_x, int root_y)
 {
   int tw, th, x, y, sw, sh;
   unsigned int width, height;
+  int len;
 
   tip_ensure_created();
   tip_format();
 
   /* Calculate window size */
-  XFontStruct *fp = fontp ? fontp : XLoadQueryFont(disp, "fixed");
-  tw = XTextWidth(fp, tipmsg, strlen(tipmsg));
-  th = (fp ? fp->ascent + fp->descent : 12);
+  len = strlen(tipmsg);
+  if (fontp != NULL) {
+    tw = XTextWidth(fontp, tipmsg, len);
+    th = fontp->ascent + fontp->descent;
+  } else {
+    tw = DefaultFontW * len;
+    th = DefaultFontH;
+  }
   width = (unsigned int)(tw + tip_pad_x * 2);
   height = (unsigned int)(th + tip_pad_y * 2);
 
@@ -602,8 +611,10 @@ static void tip_show(int root_x, int root_y)
     y = 0;
 
   XMoveResizeWindow(disp, tip, x, y, width, height);
-  XMapRaised(disp, tip);
-  tip_mapped = 1;
+  if (!tip_mapped) {
+    XMapRaised(disp, tip);
+    tip_mapped = 1;
+  }
   tip_draw();
 }
 
