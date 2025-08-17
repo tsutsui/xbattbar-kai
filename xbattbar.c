@@ -40,24 +40,16 @@ static char *ReleaseVersion="1.4.2";
 #include <signal.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <err.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/Xatom.h>
 
 #define PollingInterval 10	/* APM polling interval in sec */
-#define BI_THICKNESS    3	/* battery indicator thickness in pixels */
 
-#define BI_Bottom	0
-#define BI_Top		1
-#define BI_Left		2
-#define BI_Right	3
-#define BI_Horizontal	((bi_direction & 2) == 0)
-#define BI_Vertical	((bi_direction & 2) == 2)
-
-#define myEventMask (ExposureMask|EnterWindowMask|LeaveWindowMask|VisibilityChangeMask)
 #define DefaultFont "fixed"
-#define DiagXMergin 20
-#define DiagYMergin 5
 
 /*
  * Global variables
@@ -81,21 +73,25 @@ int alwaysontop = False;
 
 struct itimerval IntervalTimer;     /* APM polling interval timer */
 
-int bi_direction = BI_Bottom;       /* status bar location */
-int bi_height;                      /* height of Battery Indicator */
-int bi_width;                       /* width of Battery Indicator */
-int bi_x;                           /* x coordinate of upper left corner */
-int bi_y;                           /* y coordinate of upper left corner */
-int bi_thick = BI_THICKNESS;        /* thickness of Battery Indicator */
 int bi_interval = PollingInterval;  /* interval of polling APM */
 
 Display *disp;
-Window winbar;                  /* bar indicator window */
-Window winstat = -1;            /* battery status window */
-GC gcbar;
-GC gcstat;
-unsigned int width,height;
+int scr;
+Window win;
+Atom wm_delete_window;
+GC gc_fill, gc_text, gc_frame;
 XEvent theEvent;
+XFontStruct *fontp = NULL;
+
+static unsigned long pix_bg = 0;
+static unsigned long pix_fg = 0;
+
+static const char *font_name = DefaultFont;
+static char *wm_name   = "xbattbar";
+
+static unsigned int win_w = 64, win_h = 16;
+static int win_x = 0, win_y = 0;
+static int have_x = 0, have_y = 0;
 
 /*
  * function prototypes
@@ -103,11 +99,7 @@ XEvent theEvent;
 void InitDisplay(void);
 Status AllocColor(char *, unsigned long *);
 void battery_check(void);
-void plug_proc(int);
-void battery_proc(int);
 void redraw(void);
-void showdiagbox(void);
-void disposediagbox(void);
 void usage(char **);
 void about_this_program(void);
 void estimate_remain(void);
@@ -127,16 +119,14 @@ void usage(char **argv)
 {
   fprintf(stderr,
     "\n"	  
-    "usage:\t%s [-a] [-h|v] [-p sec] [-t thickness]\n"
-    "\t\t[-I color] [-O color] [-i color] [-o color]\n"
-    "\t\t[ top | bottom | left | right ]\n"
-    "-a:     always on top.\n"
+    "usage:\t%s [-h|v] [-g geometry] [-p sec]\n"
+    "\t\t[-I color] [-O color] [-i color] [-o color] [-F font]\n"
     "-v, -h: show this message.\n"
-    "-t:     bar (indicator) thickness. [def: 3 pixels]\n"
+    "-g:     set window geometry (WxH+X+Y).\n"
     "-p:     polling interval. [def: 10 sec.]\n"
     "-I, -O: bar colors in AC on-line. [def: \"green\" & \"olive drab\"]\n"
     "-i, -o: bar colors in AC off-line. [def: \"blue\" and \"red\"]\n"
-    "top, bottom, left, right: bar localtion. [def: \"bottom\"]\n",
+    "-F:     font name. [def: \"fixed\"]\n",
 	  argv[0]);
   exit(0);
 }
@@ -150,7 +140,7 @@ Status AllocColor(char *name, unsigned long *pixel)
   XColor color,exact;
   int status;
 
-  status = XAllocNamedColor(disp, DefaultColormap(disp, 0),
+  status = XAllocNamedColor(disp, DefaultColormap(disp, scr),
                            name, &color, &exact);
   *pixel = color.pixel;
 
@@ -159,91 +149,76 @@ Status AllocColor(char *name, unsigned long *pixel)
 
 /*
  * InitDisplay:
- * create small window in top or bottom
+ * create a window for WM Swallow
  */
 void InitDisplay(void)
 {
-  Window root;
-  int x,y;
-  unsigned int border,depth;
-  XSetWindowAttributes att;
 
   if((disp = XOpenDisplay(NULL)) == NULL) {
       fprintf(stderr, "xbattbar: can't open display.\n");
       exit(1);
   }
-
-  if(XGetGeometry(disp, DefaultRootWindow(disp), &root, &x, &y,
-                 &width, &height, &border, &depth) == 0) {
-    fprintf(stderr, "xbattbar: can't get window geometry\n");
-    exit(1);
-  }
+  scr = DefaultScreen(disp);
+  pix_bg = WhitePixel(disp, scr);
+  pix_fg = BlackPixel(disp, scr);
 
   if (!AllocColor(ONIN_C,&onin) ||
        !AllocColor(OFFOUT_C,&offout) ||
        !AllocColor(OFFIN_C,&offin) ||
        !AllocColor(ONOUT_C,&onout)) {
     fprintf(stderr, "xbattbar: can't allocate color resources\n");
-    exit(1);
+    exit(EXIT_FAILURE);
   }
 
-  switch (bi_direction) {
-  case BI_Top: /* (0,0) - (width, bi_thick) */
-    bi_width = width;
-    bi_height = bi_thick;
-    bi_x = 0;
-    bi_y = 0;
-    break;
-  case BI_Bottom:
-    bi_width = width;
-    bi_height = bi_thick;
-    bi_x = 0;
-    bi_y = height - bi_thick;
-    break;
-  case BI_Left:
-    bi_width = bi_thick;
-    bi_height = height;
-    bi_x = 0;
-    bi_y = 0;
-    break;
-  case BI_Right:
-    bi_width = bi_thick;
-    bi_height = height;
-    bi_x = width - bi_thick;
-    bi_y = 0;
+  XSetWindowAttributes attr = {0};
+  attr.background_pixel = pix_bg;
+  attr.event_mask = ExposureMask | StructureNotifyMask;
+
+  win = XCreateWindow(disp, RootWindow(disp, scr),
+                      have_x ? win_x : 0, have_y ? win_y : 0,
+                      win_w, win_h,
+                      0,
+                      DefaultDepth(disp, scr),
+                      InputOutput,
+                      DefaultVisual(disp, scr),
+                      CWBackPixel | CWEventMask,
+                      &attr
+    );
+
+  /* set WM_NAME / CLASS for WM Swallow */
+  XStoreName(disp, win, wm_name);
+  XClassHint ch;
+  ch.res_name  = wm_name;
+  ch.res_class = (char *)"Xbattbar";
+  XSetClassHint(disp, win, &ch);
+
+  gc_fill  = XCreateGC(disp, win, 0, NULL);
+  gc_frame = XCreateGC(disp, win, 0, NULL);
+
+  fontp = XLoadQueryFont(disp, font_name);
+  if (fontp == NULL)
+    fontp = XLoadQueryFont(disp, "fixed");
+  if (fontp != NULL) {
+    XGCValues gv = {0};
+    gv.font = fontp->fid;
+    gc_text = XCreateGC(disp, win, GCFont, &gv);
   }
 
-  winbar = XCreateSimpleWindow(disp, DefaultRootWindow(disp),
-                              bi_x, bi_y, bi_width, bi_height,
-                              0, BlackPixel(disp,0), WhitePixel(disp,0));
+  XMapWindow(disp, win);
 
-  /* make this window without its titlebar */
-  att.override_redirect = True;
-  XChangeWindowAttributes(disp, winbar, CWOverrideRedirect, &att);
-
-  XMapWindow(disp, winbar);
-
-  gcbar = XCreateGC(disp, winbar, 0, 0);
+  wm_delete_window = XInternAtom(disp, "WM_DELETE_WINDOW", False);
+  XSetWMProtocols(disp, win, &wm_delete_window, 1);
 }
 
-main(int argc, char **argv)
+int main(int argc, char **argv)
 {
-  extern char *optarg;
-  extern int optind;
   int ch;
+  char *geom = NULL;
+  Atom proto;
 
   about_this_program();
-  while ((ch = getopt(argc, argv, "at:f:hI:i:O:o:p:v")) != -1)
+  while ((ch = getopt(argc, argv, "g:F:hI:i:O:o:p:v")) != -1)
     switch (ch) {
-    case 'a':
-      alwaysontop = True;
-      break;
-
-    case 't':
-    case 'f':
-      bi_thick = atoi(optarg);
-      break;
-
     case 'I':
       ONIN_C = optarg;
       break;
@@ -257,6 +232,14 @@ main(int argc, char **argv)
       OFFOUT_C = optarg;
       break;
 
+    case 'F':
+      font_name = optarg;
+      break;
+
+    case 'g':
+      geom = optarg;
+      break;
+
     case 'p':
       bi_interval = atoi(optarg);
       break;
@@ -266,18 +249,25 @@ main(int argc, char **argv)
       usage(argv);
       break;
     }
-  argc -= optind;
-  argv += optind;
 
-  if (argc > 0) {
-    if (strcasecmp(*argv, "top") == 0)
-      bi_direction = BI_Top;
-    else if (strcasecmp(*argv, "bottom") == 0)
-      bi_direction = BI_Bottom;
-    else if (strcasecmp(*argv, "left") == 0)
-      bi_direction = BI_Left;
-    else if (strcasecmp(*argv, "right") == 0)
-      bi_direction = BI_Right;
+  if (geom) {
+    int x, y;
+    unsigned int w, h;
+    int flags = XParseGeometry(geom, &x, &y, &w, &h);
+    if (flags & WidthValue) {
+      win_w = w;
+    }
+    if (flags & HeightValue) {
+      win_h = h;
+    }
+    if (flags & XValue) {
+      have_x = 1;
+      win_x = x;
+    }
+    if (flags & YValue) {
+      have_y = 1;
+      win_y = y;
+    }
   }
 
   /*
@@ -298,134 +288,87 @@ main(int argc, char **argv)
   InitDisplay();
   signal(SIGALRM, (void *)(battery_check));
   battery_check();
-  XSelectInput(disp, winbar, myEventMask);
+  proto = XInternAtom(disp, "WM_PROTOCOLS", False);
   while (1) {
-    XWindowEvent(disp, winbar, myEventMask, &theEvent);
+    XNextEvent(disp, &theEvent);
     switch (theEvent.type) {
     case Expose:
-      /* we redraw our window since our window has been exposed. */
+    case ConfigureNotify:
       redraw();
       break;
-
-    case EnterNotify:
-      /* create battery status message */
-      showdiagbox();
-      break;
-
-    case LeaveNotify:
-      /* destroy status window */
-      disposediagbox();
-      break;
-
-    case VisibilityNotify:
-      if (alwaysontop) XRaiseWindow(disp, winbar);
-      break;
-
-    default:
-      /* for debugging */
-      fprintf(stderr, 
-	      "xbattbar: unknown event (%d) captured\n",
-	      theEvent.type);
+    case ClientMessage:
+      if (theEvent.xclient.message_type == proto &&
+          (Atom)theEvent.xclient.data.l[0] == wm_delete_window) {
+        exit(0);
+      }
     }
   }
+  return 0;
+}
+
+static void draw_widget(void)
+{
+  XWindowAttributes wa;
+  unsigned int width, height, margin, bx, by, bw, bh, fill_w;
+  unsigned int pct;
+  unsigned long col_in, col_out;
+
+  XGetWindowAttributes(disp, win, &wa);
+  width = wa.width;
+  height = wa.height;
+
+  /* background (white) */
+  XSetForeground(disp, gc_fill, pix_bg);
+  XFillRectangle(disp, win, gc_fill, 0, 0, width, height);
+
+  /* frame (black) */
+  margin = (width < 32 || height < 12) ? 1u : 2u;
+  bx = by = margin;
+  bw = (width > margin * 2U) ? (width - margin * 2U) : width;
+  bh = (height > margin * 2U) ? (height - margin * 2U) : height;
+
+  XSetForeground(disp, gc_frame, pix_fg);
+  if (bw > 1U && bh > 1U)
+    XDrawRectangle(disp, win, gc_frame, bx, by, bw - 1, bh - 1);
+
+  /* draw battery capacity */
+  pct = (battery_level < 0) ? 0U :
+    (battery_level > 100 ? 100U : (unsigned int)battery_level);
+  col_in  = ac_line ? onin  : offin;
+  col_out = ac_line ? onout : offout;
+
+  if (bw > 2U && bh > 2U) {
+    XSetForeground(disp, gc_fill, col_out);
+    XFillRectangle(disp, win, gc_fill, bx + 1U, by + 1U, bw - 2U, bh - 2U);
+
+    fill_w = (bw - 2U) * pct / 100U;
+    XSetForeground(disp, gc_fill, col_in);
+    if (fill_w > 0U)
+      XFillRectangle(disp, win, gc_fill, bx + 1U, by + 1U, fill_w, bh - 2U);
+  }
+
+  /* capacity percentage */
+  if (fontp && gc_text) {
+    char buf[8];
+    int len = snprintf(buf, sizeof(buf), "%u%%", pct);
+    int tw = XTextWidth(fontp, buf, len);
+    int tx = (int)(width - tw) / 2;
+    int ty = (int)(height + fontp->ascent - fontp->descent) / 2;
+
+    XSetForeground(disp, gc_text, pix_bg);
+    XDrawString(disp, win, gc_text, tx + 1, ty + 1, buf, len);
+    XSetForeground(disp, gc_text, pix_fg);
+    XDrawString(disp, win, gc_text, tx, ty, buf, len);
+  }
+
+  XFlush(disp);
 }
 
 void redraw(void)
 {
-  if (ac_line) {
-    plug_proc(battery_level);
-  } else {
-    battery_proc(battery_level);
-  }
+  draw_widget();
   estimate_remain();
 }
-
-
-void showdiagbox(void)
-{
-  XSetWindowAttributes att;
-  XFontStruct *fontp;
-  XGCValues theGC;
-  int pixw, pixh;
-  int boxw, boxh;
-  char diagmsg[64];
-
-  /* compose diag message and calculate its size in pixels */
-  sprintf(diagmsg,
-         "AC %s-line: battery level is %d%%",
-         ac_line ? "on" : "off", battery_level);
-  fontp = XLoadQueryFont(disp, DefaultFont);
-  pixw = XTextWidth(fontp, diagmsg, strlen(diagmsg));
-  pixh = fontp->ascent + fontp->descent;
-  boxw = pixw + DiagXMergin * 2;
-  boxh = pixh + DiagYMergin * 2;
-
-  /* create status window */
-  if(winstat != -1) disposediagbox();
-  winstat = XCreateSimpleWindow(disp, DefaultRootWindow(disp),
-                               (width-boxw)/2, (height-boxh)/2,
-                               boxw, boxh,
-                               2, BlackPixel(disp,0), WhitePixel(disp,0));
-
-  /* make this window without time titlebar */
-  att.override_redirect = True;
-  XChangeWindowAttributes(disp, winstat, CWOverrideRedirect, &att);
-  XMapWindow(disp, winstat);
-  theGC.font = fontp->fid;
-  gcstat = XCreateGC(disp, winstat, GCFont, &theGC);
-  XDrawString(disp, winstat,
-             gcstat,
-             DiagXMergin, fontp->ascent+DiagYMergin,
-             diagmsg, strlen(diagmsg));
-}
-
-void disposediagbox(void)
-{
-  if ( winstat != -1 ) {
-    XDestroyWindow(disp, winstat);
-    winstat = -1;
-  }
-}
-
-void battery_proc(int left)
-{
-  int pos;
-  if (BI_Horizontal) {
-    pos = width * left / 100;
-    XSetForeground(disp, gcbar, offin);
-    XFillRectangle(disp, winbar, gcbar, 0, 0, pos, bi_thick);
-    XSetForeground(disp, gcbar, offout);
-    XFillRectangle(disp, winbar, gcbar, pos, 0, width, bi_thick);
-  } else {
-    pos = height * left / 100;
-    XSetForeground(disp, gcbar, offin);
-    XFillRectangle(disp, winbar, gcbar, 0, height-pos, bi_thick, height);
-    XSetForeground(disp, gcbar, offout);
-    XFillRectangle(disp, winbar, gcbar, 0, 0, bi_thick, height-pos);
-  }
-  XFlush(disp);
-}
-
-void plug_proc(int left)
-{
-  int pos;
-
-  if (BI_Horizontal) {
-    pos = width * left / 100;
-    XSetForeground(disp, gcbar, onin);
-    XFillRectangle(disp, winbar, gcbar, 0, 0, pos, bi_thick);
-    XSetForeground(disp, gcbar, onout);
-    XFillRectangle(disp, winbar, gcbar, pos+1, 0, width, bi_thick);
-  } else {
-    pos = height * left / 100;
-    XSetForeground(disp, gcbar, onin);
-    XFillRectangle(disp, winbar, gcbar, 0, height-pos, bi_thick, height);
-    XSetForeground(disp, gcbar, onout);
-    XFillRectangle(disp, winbar, gcbar, 0, 0, bi_thick, height-pos);
-  }
-  XFlush(disp);
-}
-
 
 /*
  * estimating time for battery remaining / charging 
@@ -504,7 +447,6 @@ void battery_check(void)
     battery_level = ar.cret&0xff;
     redraw();
   }
-  signal(SIGALRM, (void *)(battery_check));
 }
 
 #endif /* __bsdi__ */
@@ -580,7 +522,6 @@ void battery_check(void)
     battery_level = r;
     redraw();
   }
-  signal(SIGALRM, (void *)(battery_check));
 }
 
 #endif /* __FreeBSD__ */
@@ -874,7 +815,6 @@ void battery_check(void)
     battery_level = r;
     redraw();
   }
-  signal(SIGALRM, (void *)(battery_check));
 }
 
 #endif /* linux */
