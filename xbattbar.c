@@ -96,6 +96,7 @@ static int have_x = 0, have_y = 0;
 /* for tooltip to display status */
 #define TIP_PAD_X	6
 #define TIP_PAD_Y	4
+#define TIP_FRAME_WIDTH	1
 #define TIP_MSGLEN	128
 #define TIP_DELAY	1000    /* ms */
 
@@ -119,6 +120,8 @@ void usage(char **);
 void about_this_program(void);
 void estimate_remain(void);
 
+static int pointer_in_window(Window);
+static int pointer_in_windows(void);
 static void tip_format(void);
 static void tip_ensure_created(void);
 static void tip_show(int root_x, int root_y);
@@ -365,15 +368,24 @@ int main(int argc, char **argv)
           break;
 
         case EnterNotify:
-          tip_hovering = 1;
-          tip_disp_ms = gettime_ms() + tip_delay_ms;
-          tip_xroot = theEvent.xcrossing.x_root;
-          tip_yroot = theEvent.xcrossing.y_root;
-          tip_hide();
+          if (theEvent.xcrossing.window == win) {
+            tip_hovering = 1;
+            tip_disp_ms = gettime_ms() + tip_delay_ms;
+            tip_xroot = theEvent.xcrossing.x_root;
+            tip_yroot = theEvent.xcrossing.y_root;
+          }
           break;
         case LeaveNotify:
-          tip_hovering = 0;
-          tip_hide();
+          if (theEvent.xcrossing.window == win) {
+            tip_hovering = 0;
+            if (!pointer_in_windows()) {
+              tip_hide();
+            }
+          } else if (theEvent.xcrossing.window == tip) {
+            if (!pointer_in_windows()) {
+              tip_hide();
+            }
+          }
           break;
         case MotionNotify:
           tip_xroot = theEvent.xmotion.x_root;
@@ -478,6 +490,39 @@ void redraw(void)
  * tooltip to display status
  */
 
+static int pointer_in_window(Window window)
+{
+  Window root_ret, child_ret;
+  int rx, ry, wx, wy;
+  unsigned int mask;
+  XWindowAttributes wa;
+
+  if (window == 0) {
+    return 0;
+  }
+  if (!XGetWindowAttributes(disp, window, &wa)) {
+    return 0;
+  }
+
+  if (!XQueryPointer(disp, window, &root_ret, &child_ret,
+    &rx, &ry, &wx, &wy, &mask)) {
+    return 0;
+  }
+
+  return wx >= 0 && wy >= 0 && wx < (int)wa.width && wy < (int)wa.height;
+}
+
+static int pointer_in_windows(void)
+{
+  if (pointer_in_window(win)) {
+    return 1;
+  }
+  if (tip_mapped && pointer_in_window(tip)) {
+    return 1;
+  }
+  return 0;
+}
+
 static void tip_format(void)
 {
   snprintf(tipmsg, sizeof(tipmsg),
@@ -492,12 +537,13 @@ static void tip_ensure_created(void)
   tip = XCreateSimpleWindow(
           disp, RootWindow(disp, scr),
           0, 0, 1, 1,               /* pos and size will be updated later */
-          1,                        /* width of frame */
+          TIP_FRAME_WIDTH,          /* width of frame */
           pix_fg, pix_bg);
   XSetWindowAttributes swa;
   swa.override_redirect = True;     /* exclude from WM */
   XChangeWindowAttributes(disp, tip, CWOverrideRedirect, &swa);
-  XSelectInput(disp, tip, ExposureMask); /* Expose for updates */
+  XSelectInput(disp, tip, ExposureMask |
+    EnterWindowMask | LeaveWindowMask | PointerMotionMask);
 }
 
 static void tip_draw(void)
@@ -543,7 +589,7 @@ static void tip_show(int root_x, int root_y)
 
   /* Adjust window location */
   x = root_x + 8;
-  y = root_y - height;
+  y = root_y - height - (TIP_FRAME_WIDTH * 2 + 2);
   sw = DisplayWidth(disp, scr);
   sh = DisplayHeight(disp, scr);
   if (x + (int)width > sw)
