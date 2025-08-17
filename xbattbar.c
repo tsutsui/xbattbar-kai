@@ -26,7 +26,6 @@
 static char *ReleaseVersion="1.4.2";
 
 #include <sys/types.h>
-#include <sys/time.h>
 
 #ifdef __NetBSD__
 #define ENVSYSUNITNAMES
@@ -37,12 +36,15 @@ static char *ReleaseVersion="1.4.2";
 #include <string.h>
 #endif /* __NetBSD__ */
 
-#include <signal.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <unistd.h>
+#include <time.h>
 #include <err.h>
+#include <errno.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
@@ -70,8 +72,6 @@ char *OFFIN_C  = "blue";
 char *OFFOUT_C = "red";
 
 int alwaysontop = False;
-
-struct itimerval IntervalTimer;     /* APM polling interval timer */
 
 int bi_interval = PollingInterval;  /* interval of polling APM */
 
@@ -129,6 +129,15 @@ void usage(char **argv)
     "-F:     font name. [def: \"fixed\"]\n",
 	  argv[0]);
   exit(0);
+}
+
+static int64_t
+gettime_ms(void)
+{
+  struct timespec ts;
+
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 /*
@@ -215,6 +224,8 @@ int main(int argc, char **argv)
   int ch;
   char *geom = NULL;
   Atom proto;
+  int64_t next_ms;
+  int xfd;
 
   about_this_program();
   while ((ch = getopt(argc, argv, "g:F:hI:i:O:o:p:v")) != -1)
@@ -271,39 +282,63 @@ int main(int argc, char **argv)
   }
 
   /*
-   * set APM polling interval timer
-   */
-  IntervalTimer.it_interval.tv_sec = (long)bi_interval;
-  IntervalTimer.it_interval.tv_usec = (long)0;
-  IntervalTimer.it_value.tv_sec = (long)1;
-  IntervalTimer.it_value.tv_usec = (long)0;
-  if ( setitimer(ITIMER_REAL, &IntervalTimer, NULL) != 0 ) {
-    fprintf(stderr,"xbattbar: can't set interval timer\n");
-    exit(1);
-  }
-
-  /*
    * X Window main loop
    */
   InitDisplay();
-  signal(SIGALRM, (void *)(battery_check));
   battery_check();
+  next_ms = gettime_ms() + bi_interval * 1000;
+
+  xfd = ConnectionNumber(disp);
   proto = XInternAtom(disp, "WM_PROTOCOLS", False);
+
   while (1) {
-    XNextEvent(disp, &theEvent);
-    switch (theEvent.type) {
-    case Expose:
-    case ConfigureNotify:
-      redraw();
-      break;
-    case ClientMessage:
-      if (theEvent.xclient.message_type == proto &&
-          (Atom)theEvent.xclient.data.l[0] == wm_delete_window) {
-        exit(0);
+    fd_set fds;
+    struct timeval tv;
+    int64_t wait_ms;
+    int rv;
+
+    FD_ZERO(&fds);
+    FD_SET(xfd, &fds);
+    wait_ms = next_ms - gettime_ms();
+    if (wait_ms < 0) {
+      wait_ms = 0;
+    }
+    tv.tv_sec = wait_ms / 1000;
+    tv.tv_usec = (wait_ms % 1000) * 1000;
+    rv = select(xfd + 1, &fds, NULL, NULL, &tv);
+    if (rv < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      perror("select");
+      exit(EXIT_FAILURE);
+    }
+    if (rv > 0 && FD_ISSET(xfd, &fds)) {
+      while (XPending(disp) > 0) {
+        XNextEvent(disp, &theEvent);
+        switch (theEvent.type) {
+        case Expose:
+        case ConfigureNotify:
+          redraw();
+          break;
+        case ClientMessage:
+          if (theEvent.xclient.message_type == proto &&
+              (Atom)theEvent.xclient.data.l[0] == wm_delete_window) {
+            goto out;
+          }
+        }
+      }
+    }
+    if (gettime_ms() >= next_ms) {
+      battery_check();
+      while (gettime_ms() >= next_ms) {
+        next_ms += bi_interval * 1000;
       }
     }
   }
-  return 0;
+
+ out:
+  exit(EXIT_SUCCESS);
 }
 
 static void draw_widget(void)
@@ -775,7 +810,6 @@ void battery_check(void)
   errno = 0;
   if ( (pt = fopen( APM_PROC, "r" )) == NULL) {
     fprintf(stderr, "xbattbar: Can't read proc info: %s\n", strerror(errno));
-    signal(SIGALRM, (void *)(battery_check));
     exit(1);
   }
 
