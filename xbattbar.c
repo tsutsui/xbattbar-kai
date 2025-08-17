@@ -33,11 +33,11 @@ static char *ReleaseVersion="1.4.2";
 #include <sys/envsys.h>
 #include <paths.h>
 #include <stdlib.h>
-#include <string.h>
 #endif /* __NetBSD__ */
 
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 #include <unistd.h>
 #include <time.h>
 #include <err.h>
@@ -93,6 +93,16 @@ static unsigned int win_w = 64, win_h = 16;
 static int win_x = 0, win_y = 0;
 static int have_x = 0, have_y = 0;
 
+/* for tooltip to display status */
+#define TIP_PAD_X	6
+#define TIP_PAD_Y	4
+#define TIP_MSGLEN	128
+
+static Window tip = (Window)0;
+static int tip_mapped = 0;
+static unsigned int tip_pad_x = TIP_PAD_X, tip_pad_y = TIP_PAD_Y;
+static char tipmsg[TIP_MSGLEN];
+
 /*
  * function prototypes
  */
@@ -103,6 +113,12 @@ void redraw(void);
 void usage(char **);
 void about_this_program(void);
 void estimate_remain(void);
+
+static void tip_format(void);
+static void tip_ensure_created(void);
+static void tip_show(int root_x, int root_y);
+static void tip_draw(void);
+static void tip_hide(void);
 
 /*
  * usage of this command
@@ -181,7 +197,8 @@ void InitDisplay(void)
 
   XSetWindowAttributes attr = {0};
   attr.background_pixel = pix_bg;
-  attr.event_mask = ExposureMask | StructureNotifyMask;
+  attr.event_mask = ExposureMask | StructureNotifyMask |
+    EnterWindowMask | LeaveWindowMask | PointerMotionMask;
 
   win = XCreateWindow(disp, RootWindow(disp, scr),
                       have_x ? win_x : 0, have_y ? win_y : 0,
@@ -318,9 +335,26 @@ int main(int argc, char **argv)
         XNextEvent(disp, &theEvent);
         switch (theEvent.type) {
         case Expose:
+          if (theEvent.xexpose.window == win) {
+            redraw();
+          } else if (theEvent.xexpose.window == tip) {
+            tip_draw();
+          }
+          break;
         case ConfigureNotify:
           redraw();
           break;
+
+        case EnterNotify:
+          tip_show(theEvent.xcrossing.x_root, theEvent.xcrossing.y_root);
+          break;
+        case LeaveNotify:
+          tip_hide();
+          break;
+        case MotionNotify:
+          tip_show(theEvent.xmotion.x_root, theEvent.xmotion.y_root);
+          break;
+
         case ClientMessage:
           if (theEvent.xclient.message_type == proto &&
               (Atom)theEvent.xclient.data.l[0] == wm_delete_window) {
@@ -403,6 +437,105 @@ void redraw(void)
 {
   draw_widget();
   estimate_remain();
+  if (tip_mapped) {
+    tip_format();
+    tip_draw();
+  }
+}
+
+/*
+ * tooltip to display status
+ */
+
+static void tip_format(void)
+{
+  snprintf(tipmsg, sizeof(tipmsg),
+           "AC %s-line: battery level is %d%%",
+           ac_line ? "on" : "off", battery_level);
+}
+
+static void tip_ensure_created(void)
+{
+  if (tip)
+    return;
+  tip = XCreateSimpleWindow(
+          disp, RootWindow(disp, scr),
+          0, 0, 1, 1,               /* pos and size will be updated later */
+          1,                        /* width of frame */
+          pix_fg, pix_bg);
+  XSetWindowAttributes swa;
+  swa.override_redirect = True;     /* exclude from WM */
+  XChangeWindowAttributes(disp, tip, CWOverrideRedirect, &swa);
+  XSelectInput(disp, tip, ExposureMask); /* Expose for updates */
+}
+
+static void tip_draw(void)
+{
+  if (!tip_mapped)
+    return;
+
+  XWindowAttributes wa;
+  XGetWindowAttributes(disp, tip, &wa);
+  unsigned int width = wa.width, height = wa.height;
+
+  /* background and frame */
+  XSetForeground(disp, gc_fill, pix_bg);
+  XFillRectangle(disp, tip, gc_fill, 0, 0, width, height);
+  XSetForeground(disp, gc_frame, pix_fg);
+  XDrawRectangle(disp, tip, gc_frame, 0, 0, width - 1, height - 1);
+
+  /* status strings */
+  XFontStruct *fp = fontp ? fontp : XLoadQueryFont(disp, "fixed");
+  int ty = (int)tip_pad_y + (fp ? fp->ascent : 10);
+  int tx = (int)tip_pad_x;
+
+  XSetForeground(disp, gc_text, pix_fg);
+  XDrawString(disp, tip, gc_text, tx, ty, tipmsg, strlen(tipmsg));
+
+  XFlush(disp);
+}
+
+static void tip_show(int root_x, int root_y)
+{
+  int tw, th, x, y, sw, sh;
+  unsigned int width, height;
+
+  tip_ensure_created();
+  tip_format();
+
+  /* Calculate window size */
+  XFontStruct *fp = fontp ? fontp : XLoadQueryFont(disp, "fixed");
+  tw = XTextWidth(fp, tipmsg, strlen(tipmsg));
+  th = (fp ? fp->ascent + fp->descent : 12);
+  width = (unsigned int)(tw + tip_pad_x * 2);
+  height = (unsigned int)(th + tip_pad_y * 2);
+
+  /* Adjust window location */
+  x = root_x + 8;
+  y = root_y - height;
+  sw = DisplayWidth(disp, scr);
+  sh = DisplayHeight(disp, scr);
+  if (x + (int)width > sw)
+    x = sw - (int)width;
+  if (y + (int)height > sh)
+    y = sh - (int)height;
+  if (x < 0)
+    x = 0;
+  if (y < 0)
+    y = 0;
+
+  XMoveResizeWindow(disp, tip, x, y, width, height);
+  XMapRaised(disp, tip);
+  tip_mapped = 1;
+  tip_draw();
+}
+
+static void tip_hide(void)
+{
+  if (!tip)
+    return;
+  XUnmapWindow(disp, tip);
+  tip_mapped = 0;
 }
 
 /*
