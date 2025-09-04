@@ -108,7 +108,7 @@ static unsigned int tip_pad_x = TIP_PAD_X, tip_pad_y = TIP_PAD_Y;
 static char tipmsg[TIP_MSGLEN];
 static const int tip_delay_ms = TIP_DELAY;
 static int tip_hovering = 0;
-static int64_t tip_disp_ms = 0;
+static struct timespec tip_disp = { 0 };
 static int tip_xroot = 0, tip_yroot = 0;
 
 /*
@@ -157,13 +157,54 @@ void usage(char **argv)
   exit(0);
 }
 
-static int64_t
-gettime_ms(void)
+/*
+ * struct timespec helper functions
+ */
+static inline void
+timespec_sub(struct timespec *tsp, struct timespec *usp, struct timespec *vsp)
 {
-  struct timespec ts;
+  vsp->tv_sec = tsp->tv_sec - usp->tv_sec;
+  vsp->tv_nsec = tsp->tv_nsec - usp->tv_nsec;
+  if (vsp->tv_nsec < 0) {
+    vsp->tv_sec--;
+    vsp->tv_nsec += 1000000000;
+  }
+  if (vsp->tv_sec < 0) {
+    /* return zero if (tsp < usp) */
+    vsp->tv_sec = 0;
+    vsp->tv_nsec = 0;
+  }
+}
 
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+static inline void
+timespec_add_msec(struct timespec *tsp, time_t msec)
+{
+  tsp->tv_sec += msec / 1000;
+  tsp->tv_nsec += (msec % 1000) * 1000000;
+  if (tsp->tv_nsec >= 1000000000) {
+    tsp->tv_sec++;
+    tsp->tv_nsec -= 1000000000;
+  }
+}
+
+static inline int
+timespec_cmp(struct timespec *tsp, struct timespec *usp)
+{
+  if (tsp->tv_sec != usp->tv_sec) {
+    if (tsp->tv_sec < usp->tv_sec) {
+      return -1; /* tsp < usp */
+    } else {
+      return 1;  /* tsp > usp */
+    }
+  }
+  if (tsp->tv_nsec != usp->tv_nsec) {
+    if (tsp->tv_nsec < usp->tv_nsec) {
+      return -1; /* tsp < usp */
+    } else {
+      return 1;  /* tsp > usp */
+    }
+  }
+  return 0;      /* tsp == usp */
 }
 
 /*
@@ -251,7 +292,7 @@ int main(int argc, char **argv)
   int ch;
   char *geom = NULL;
   Atom proto;
-  int64_t next_ms;
+  struct timespec next;
   int xfd;
 
   about_this_program();
@@ -313,39 +354,33 @@ int main(int argc, char **argv)
    */
   InitDisplay();
   battery_check();
-  next_ms = gettime_ms() + bi_interval * 1000;
-
+  clock_gettime(CLOCK_MONOTONIC, &next);
+  timespec_add_msec(&next, (time_t)bi_interval * 1000);
   xfd = ConnectionNumber(disp);
   proto = XInternAtom(disp, "WM_PROTOCOLS", False);
-
   while (1) {
     fd_set fds;
+    struct timespec now, wait, hoverwait;
     struct timeval tv;
-    int64_t current_ms, wait_ms, battwait_ms, hoverwait_ms;
     int rv;
 
     FD_ZERO(&fds);
     FD_SET(xfd, &fds);
 
     /* Calculate wait time to poll the next battery status */
-    current_ms = gettime_ms();
-    battwait_ms = next_ms - current_ms;
-    if (battwait_ms < 0) {
-      battwait_ms = 0;
-    }
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    timespec_sub(&next, &now, &wait);
 
     /* Calculate wait time for delayed tooltip */
-    hoverwait_ms = INT64_MAX;
     if (tip_hovering && !tip_mapped) {
-      hoverwait_ms = tip_disp_ms - current_ms;
-      if (hoverwait_ms < 0) {
-        hoverwait_ms = 0;
+      timespec_sub(&tip_disp, &now, &hoverwait);
+      if (timespec_cmp(&wait, &hoverwait) > 0) {
+        wait = hoverwait;
       }
     }
-    wait_ms = (battwait_ms < hoverwait_ms) ? battwait_ms : hoverwait_ms;
 
-    tv.tv_sec = wait_ms / 1000;
-    tv.tv_usec = (wait_ms % 1000) * 1000;
+    tv.tv_sec = wait.tv_sec;
+    tv.tv_usec = wait.tv_nsec / 1000;
     rv = select(xfd + 1, &fds, NULL, NULL, &tv);
     if (rv < 0) {
       if (errno == EINTR) {
@@ -372,7 +407,8 @@ int main(int argc, char **argv)
         case EnterNotify:
           if (theEvent.xcrossing.window == win) {
             tip_hovering = 1;
-            tip_disp_ms = gettime_ms() + tip_delay_ms;
+            clock_gettime(CLOCK_MONOTONIC, &tip_disp);
+            timespec_add_msec(&tip_disp, tip_delay_ms);
             tip_xroot = theEvent.xcrossing.x_root;
             tip_yroot = theEvent.xcrossing.y_root;
           }
@@ -405,14 +441,18 @@ int main(int argc, char **argv)
         }
       }
     }
-    if (gettime_ms() >= next_ms) {
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (timespec_cmp(&now, &next) >= 0) {
       battery_check();
-      while (gettime_ms() >= next_ms) {
-        next_ms += bi_interval * 1000;
+      while (timespec_cmp(&now, &next) >= 0) {
+        timespec_add_msec(&next, bi_interval * 1000);
       }
     }
-    if (tip_hovering && !tip_mapped && gettime_ms() >= tip_disp_ms) {
-      tip_show(tip_xroot, tip_yroot);
+    if (tip_hovering && !tip_mapped) {
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      if (timespec_cmp(&now, &tip_disp) > 0) {
+        tip_show(tip_xroot, tip_yroot);
+      }
     }
   }
 
