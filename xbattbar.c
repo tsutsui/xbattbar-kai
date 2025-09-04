@@ -452,6 +452,7 @@ void showdiagbox(void)
              gcstat,
              DiagXMergin, fontp->ascent+DiagYMergin,
              diagmsg, strlen(diagmsg));
+  XFreeFont(disp, fontp);
 }
 
 void disposediagbox(void)
