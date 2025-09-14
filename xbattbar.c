@@ -32,11 +32,11 @@ static char *ReleaseVersion="1.4.2";
 #include <sys/param.h>
 #include <sys/envsys.h>
 #include <paths.h>
-#include <stdlib.h>
+#include <stdint.h>
 #endif /* __NetBSD__ */
 
 #include <stdio.h>
-#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
